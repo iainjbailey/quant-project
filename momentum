@@ -1,0 +1,143 @@
+import numpy as np
+
+LEV = 1.00; 
+
+
+class DualMomentumInOut(QCAlgorithm):
+
+    def Initialize(self):
+
+        self.SetStartDate(2010, 1, 1)
+        self.SetEndDate(2020, 7, 1)
+        self.cap = 100000
+
+        #treasury etfs
+        self.TLT = self.AddEquity('TLT', Resolution.Hour).Symbol
+        self.TLH = self.AddEquity('TLH', Resolution.Hour).Symbol
+        self.IEF = self.AddEquity('IEF', Resolution.Hour).Symbol
+        self.IEI = self.AddEquity('IEI', Resolution.Hour).Symbol
+        
+        #tech etfs
+        self.QQQ = self.AddEquity('QQQ', Resolution.Hour).Symbol
+        #self.FDN = self.AddEquity('FDN', Resolution.Hour).Symbol # potential highers returns but higher risk of margin call
+        #self.IGV = self.AddEquity('IGV', Resolution.Hour).Symbol # potential highers returns but higher risk of margin call
+        #self.FXL = self.AddEquity('FXL', Resolution.Hour).Symbol # potential highers returns but higher risk of margin call
+        
+        #s&p500 sector etfs
+        self.XLP = self.AddEquity('XLP', Resolution.Hour).Symbol
+        self.XLU = self.AddEquity('XLU', Resolution.Hour).Symbol
+        self.XLV = self.AddEquity('XLV', Resolution.Hour).Symbol
+        self.XLB = self.AddEquity('XLB', Resolution.Hour).Symbol
+        self.XLE = self.AddEquity('XLE', Resolution.Hour).Symbol
+        self.XLF = self.AddEquity('XLF', Resolution.Hour).Symbol
+        self.XLI = self.AddEquity('XLI', Resolution.Hour).Symbol
+        self.XLK = self.AddEquity('XLK', Resolution.Hour).Symbol
+        self.XLY = self.AddEquity('XLY', Resolution.Hour).Symbol
+        
+        self.ASSETS = [self.TLT, self.TLH, self.IEF, self.IEI,
+                        self.QQQ, #self.FDN,# self.IGV, self.FXL,
+                        self.XLP, self.XLU, self.XLV, self.XLB, 
+                        self.XLE, self.XLF, self.XLI, self.XLK,
+                        self.XLY]
+                        
+        self.BONDS = self.ASSETS[:4]
+        self.STOCKS = self.ASSETS[4:]
+        
+        # tickers only added for trading signals
+        self.SLV = self.AddEquity('SLV', Resolution.Daily).Symbol  
+        self.GLD = self.AddEquity('GLD', Resolution.Daily).Symbol  
+        self.XLI = self.AddEquity('XLI', Resolution.Daily).Symbol 
+        self.XLU = self.AddEquity('XLU', Resolution.Daily).Symbol
+        self.DBB = self.AddEquity('DBB', Resolution.Daily).Symbol  
+        self.UUP = self.AddEquity('UUP', Resolution.Daily).Symbol  
+        self.MKT = self.AddEquity('SPY', Resolution.Daily).Symbol          
+
+        self.pairs = [self.SLV, self.GLD, self.XLI, self.XLU, self.DBB, self.UUP]
+        
+        self.bull = 1        
+        self.count = 0 
+        self.outday = 0        
+        self.wt = {}
+        self.real_wt = {}
+        self.mkt = []
+        self.SetWarmUp(timedelta(350))
+
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.AfterMarketOpen('SPY', 100),
+            self.calculate_signal)
+           
+        symbols = [self.MKT] + self.pairs
+        for symbol in symbols:
+            self.consolidator = TradeBarConsolidator(timedelta(days=1))
+            self.consolidator.DataConsolidated += self.consolidation_handler
+            self.SubscriptionManager.AddConsolidator(symbol, self.consolidator)
+        
+        self.history = self.History(symbols, 127, Resolution.Daily)
+        if self.history.empty or 'close' not in self.history.columns:
+            return
+        self.history = self.history['close'].unstack(level=0).dropna()
+        
+        
+    def consolidation_handler(self, sender, consolidated):
+        self.history.loc[consolidated.EndTime, consolidated.Symbol] = consolidated.Close
+        self.history = self.history.iloc[-127:]  
+            
+   
+    def returns(self, symbol):  # calulate 1 year (252 day) returns
+        prices = self.History(symbol, TimeSpan.FromDays(273), Resolution.Daily).close
+        return prices[-21] / prices[0]
+        
+        
+    def calculate_signal(self):
+        
+        vola = self.history[[self.MKT]].pct_change().std() * np.sqrt(252)
+        wait_days = int(vola * 85)
+        period = int((1.0 - vola) * 85)        
+        r = self.history.pct_change(period).iloc[-1]
+
+        exit = ((r[self.SLV] < r[self.GLD]) and (r[self.XLI] < r[self.XLU]) and (r[self.DBB] < r[self.UUP]))
+
+        if exit:
+            self.bull = False
+            self.outday = self.count
+        if self.count >= self.outday + wait_days:
+            self.bull = True
+        self.count += 1
+        
+        # choose treasuries etf with highest returns
+        selectedBond = self.TLT
+        selectedBondRet = self.returns(selectedBond)
+        
+        for bond in self.BONDS:
+            BondRet = self.returns(bond)
+            if selectedBondRet < BondRet:
+                selectedBondRet = BondRet
+                selectedBond = bond
+        
+        # choose stocks etf with highest returns        
+        selectedStock = self.QQQ    
+        selectedStockRet = self.returns(selectedStock)
+        
+        for stock in self.STOCKS:
+            StockRet = self.returns(stock)
+            if selectedStockRet < StockRet:
+                selectedStockRet = StockRet
+                selectedStock = stock
+            
+        for sec in self.ASSETS:
+            if not self.bull:
+                self.wt[sec] = 2 if sec is selectedBond else 0
+            elif self.bull:    
+                self.wt[sec] = 2 if sec is selectedStock else 0
+        self.trade()     
+
+                    
+    def trade(self):
+
+        for sec, weight in self.wt.items():
+            if weight == 0 and self.Portfolio[sec].IsLong:
+                self.Liquidate(sec)
+                
+            cond1 = weight == 0 and self.Portfolio[sec].IsLong
+            cond2 = weight > 0 and not self.Portfolio[sec].Invested
+            if cond1 or cond2:
+                self.SetHoldings(sec, weight)
